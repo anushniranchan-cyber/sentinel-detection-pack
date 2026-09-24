@@ -1,0 +1,30 @@
+// ============================================================================
+// HUNT-02: SharePoint exfiltration staging — who touched what before download
+// Use: after a mass-download alert, reconstruct the user's full file-access
+// pattern: previews, shares, and downloads, to distinguish theft from sync.
+// MITRE: T1213 (Information from Information Repositories), T1039 (Data from
+// Network Shared Drive)
+// ============================================================================
+let suspectUser = ""; // <-- set UPN
+let window = 7d;
+OfficeActivity
+| where TimeGenerated > ago(window)
+| where UserId == suspectUser
+| where RecordType in ("SharePointFileOperation", "OneDrive")
+| extend fileName = tostring(ObjectId)
+| summarize ops = count(),
+            downloads = countif(Operation in ("FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial")),
+            previews = countif(Operation == "FilePreviewed"),
+            shares = countif(Operation startswith "Sharing"),
+            firstSeen = min(TimeGenerated),
+            lastSeen = max(TimeGenerated)
+            by Operation, bin(TimeGenerated, 1h)
+| order by TimeGenerated asc
+// Companion: external sharing events by the same user (highest exfil risk)
+| join kind=fullouter (
+    OfficeActivity
+    | where TimeGenerated > ago(window)
+    | where UserId == suspectUser
+    | where Operation startswith "Sharing" or Operation == "AddedToSecureLink"
+    | project TimeGenerated, Operation, ObjectId, ClientIP
+) on TimeGenerated

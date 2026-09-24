@@ -1,0 +1,39 @@
+// ============================================================================
+// HUNT-05: Phishing-to-spray kill chain — correlate email clicks with the
+// credential-access that follows. Finds users who clicked a link (or opened
+// an attachment) in the last 48h and then became spray targets.
+// MITRE: T1566 (Phishing) -> T1110 (Brute Force)
+// Requires: OfficeActivity (or Defender for Office 365 EmailEvents) + SigninLogs
+// ============================================================================
+let window = 2d;
+// Step 1: users with suspicious email interactions (link clicks / attachment opens)
+let phishedUsers =
+    OfficeActivity
+    | where TimeGenerated > ago(window)
+    | where RecordType == "ExchangeAdmin" or Operation in ("UrlClick", "AttachmentDownload")
+    // Refine with your email-security table if available:
+    // EmailEvents | where ThreatTypes has "Phish" | distinct RecipientEmailAddress
+    | distinct UserId;
+// Step 2: failed sign-ins against those users (spray follow-up)
+SigninLogs
+| where TimeGenerated > ago(window)
+| where tostring(ResultType) in ("50126", "50053", "50055", "50057")
+| where UserPrincipalName in (phishedUsers)
+| summarize failCount = count(),
+            distinctIps = dcount(IPAddress),
+            srcIps = make_set(IPAddress, 20),
+            firstFail = min(TimeGenerated),
+            lastFail = max(TimeGenerated)
+            by UserPrincipalName
+| where failCount >= 5
+// Step 3: did any of them SUCCEED afterwards? (compromise confirmation)
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated > ago(window)
+    | where ResultType == 0
+    | project UserPrincipalName, successIp = IPAddress, successTime = TimeGenerated
+) on UserPrincipalName
+| extend compromised = isnotempty(successIp)
+| project UserPrincipalName, failCount, distinctIps, srcIps, firstFail, lastFail,
+          compromised, successIp, successTime
+| order by compromised desc, failCount desc

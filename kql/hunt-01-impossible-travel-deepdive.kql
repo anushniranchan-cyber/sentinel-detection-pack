@@ -1,0 +1,26 @@
+// ============================================================================
+// HUNT-01: Impossible Travel — deep-dive companion to the analytic rule
+// Use: ad-hoc hunting in Logs, or paste into a Hunting query. Investigates a
+// flagged user over a wider window (7d) to build the full travel timeline.
+// MITRE: T1078 (Valid Accounts)
+// ============================================================================
+let suspectUser = ""; // <-- set UPN, e.g. "user@contoso.com"
+let window = 7d;
+SigninLogs
+| where TimeGenerated > ago(window)
+| where UserPrincipalName == suspectUser
+| where ResultType == 0
+| extend country = tostring(LocationDetails.countryOrRegion),
+         city = tostring(LocationDetails.city),
+         lat = todouble(LocationDetails.geoCoordinates.latitude),
+         lon = todouble(LocationDetails.geoCoordinates.longitude)
+| project TimeGenerated, IPAddress, country, city, lat, lon, AppDisplayName, DeviceDetail
+| order by TimeGenerated asc
+// Pivot: any sign-in from a country the user has NEVER used before this week?
+| join kind=leftanti (
+    SigninLogs
+    | where TimeGenerated between (ago(90d) .. ago(window))
+    | where UserPrincipalName == suspectUser and ResultType == 0
+    | extend country = tostring(LocationDetails.countryOrRegion)
+    | distinct country
+) on country

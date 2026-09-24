@@ -1,0 +1,41 @@
+// ============================================================================
+// HUNT-04: Lateral movement blast radius — map every host touched from a
+// compromised source host via admin shares, RDP, WinRM, and PsExec patterns.
+// Use: post-compromise scoping. Start from a known-compromised host.
+// MITRE: T1021 (Remote Services), T1047 (WMI), T1083 (File and Directory
+// Discovery)
+// Requires: CrowdStrike Falcon events in CommonSecurityLog (CEF connector)
+// ============================================================================
+let compromisedHost = ""; // <-- set source host, e.g. "WS-1042"
+let window = 7d;
+let lmIndicators = dynamic(["admin$", "c$", "psexec", "wmic", "winrm", "mstsc", "net use"]);
+// Outbound LM attempts FROM the compromised host
+CommonSecurityLog
+| where TimeGenerated > ago(window)
+| where DeviceVendor == "CrowdStrike"
+| where tostring(SourceHostName) == compromisedHost or tostring(DeviceName) == compromisedHost
+| extend blob = tolower(strcat(tostring(AdditionalExtensions), " ", tostring(FileName), " ", tostring(Message)))
+| mv-apply indicator = lmIndicators to typeof(string) on (
+    where blob contains indicator
+    | extend matchedIndicator = indicator
+)
+| summarize attempts = count(),
+            indicators = make_set(matchedIndicator),
+            firstSeen = min(TimeGenerated),
+            lastSeen = max(TimeGenerated)
+            by TargetHost = tostring(DestinationHostName)
+// Inbound: which OTHER hosts reached INTO the compromised host? (pivot sources)
+| union (
+    CommonSecurityLog
+    | where TimeGenerated > ago(window)
+    | where DeviceVendor == "CrowdStrike"
+    | where tostring(DestinationHostName) == compromisedHost
+    | extend blob = tolower(strcat(tostring(AdditionalExtensions), " ", tostring(FileName)))
+    | mv-apply indicator = lmIndicators to typeof(string) on (
+        where blob contains indicator
+        | extend matchedIndicator = indicator
+    )
+    | summarize inboundAttempts = count(),
+                inboundIndicators = make_set(matchedIndicator)
+                by SourceHost = tostring(SourceHostName)
+)

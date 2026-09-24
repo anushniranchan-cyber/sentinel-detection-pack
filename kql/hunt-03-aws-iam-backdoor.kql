@@ -1,0 +1,39 @@
+// ============================================================================
+// HUNT-03: AWS IAM backdoor accounts — persistence via access keys & policies
+// Use: hunt for dormant persistence. Finds access keys created >30d ago that
+// were NEVER used, plus policy versions created outside change windows.
+// MITRE: T1098 (Account Manipulation), T1078 (Valid Accounts)
+// Requires: AWSCloudTrail (management events)
+// ============================================================================
+let window = 30d;
+// 1) Access keys created in window: which have never been used since?
+AWSCloudTrail
+| where TimeGenerated > ago(window)
+| where EventName == "CreateAccessKey"
+| where isempty(ErrorCode)
+| extend actorArn = tostring(parse_json(UserIdentity.arn)),
+         targetUser = tostring(parse_json(RequestParameters).userName),
+         accessKeyId = tostring(parse_json(ResponseElements).accessKey.accessKeyId),
+         srcIp = SourceIpAddress
+| project keyCreated = TimeGenerated, actorArn, targetUser, accessKeyId, srcIp
+| join kind=leftanti (
+    // Key usage appears as authenticated API calls; approximate by any
+    // CloudTrail event whose userName matches the key owner after creation
+    AWSCloudTrail
+    | where TimeGenerated > ago(window)
+    | extend userName = tostring(parse_json(UserIdentity.userName))
+    | distinct userName
+) on $left.targetUser == $right.userName
+// 2) Policy versions created outside business hours (possible backdoor policy)
+| union (
+    AWSCloudTrail
+    | where TimeGenerated > ago(window)
+    | where EventName in ("CreatePolicyVersion", "SetDefaultPolicyVersion", "PutRolePolicy")
+    | where isempty(ErrorCode)
+    | extend hour = datetime_part("hour", TimeGenerated)
+    | where hour < 6 or hour > 20   // adjust to your change window
+    | extend actorArn = tostring(parse_json(UserIdentity.arn)),
+             policyArn = tostring(parse_json(RequestParameters).policyArn),
+             srcIp = SourceIpAddress
+    | project TimeGenerated, EventName, actorArn, policyArn, srcIp
+)

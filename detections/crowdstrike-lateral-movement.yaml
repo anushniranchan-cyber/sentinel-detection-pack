@@ -1,0 +1,80 @@
+id: a2d6c814-4f1b-4e9a-8c7d-3b9e15f2a8c6
+name: CrowdStrike Lateral Movement Pattern
+description: |
+  Correlates CrowdStrike Falcon detections (ingested via the CEF/CommonSecurityLog
+  connector) to surface lateral-movement behavior chains: remote service creation,
+  PsExec/WMI execution, and SMB admin-share access on a host within a short
+  window. Maps to T1021 (Remote Services) and T1047 (WMI).
+severity: High
+status: Available
+requiredDataConnectors:
+  - connectorId: CrowdStrikeFalconStreamingAPI
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 30m
+queryPeriod: 30m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - LateralMovement
+  - Execution
+relevantTechniques:
+  - T1021
+  - T1047
+query: |
+  // Lateral-movement behavior chain from CrowdStrike Falcon events forwarded
+  // to Sentinel via the CEF connector (CommonSecurityLog).
+  // TUNING: CHAIN_THRESHOLD = minimum distinct LM techniques per host per window.
+  let CHAIN_THRESHOLD = 2;
+  let LOOKBACK = 30m;
+  // Technique signatures observed in Falcon detection summaries / command lines
+  let lmPatterns = dynamic([
+      "psexec", "wmic", "winrm", "schtasks", "\\\\admin$", "\\\\c$",
+      "net use", "mimikatz", "sekurlsa", "rubeus", "cobalt",
+      "powershell -enc", "powershell -e ", "invoke-mimikatz",
+      "sc \\\\ create", "remote service"
+  ]);
+  CommonSecurityLog
+  | where TimeGenerated > ago(LOOKBACK)
+  | where DeviceVendor == "CrowdStrike"
+  | extend cmdLine = tostring(AdditionalExtensions),
+           fileName = tostring(FileName),
+           srcHost = tostring(SourceHostName),
+           dstHost = tostring(DestinationHostName),
+           user = tostring(DestinationUserName),
+           sev = tostring(DeviceEventClassID)
+  | extend blob = strcat(cmdLine, " ", fileName, " ", sev)
+  | extend lowerBlob = tolower(blob)
+  | mv-apply pattern = lmPatterns to typeof(string) on (
+      where lowerBlob contains tolower(pattern)
+      | extend matchedPattern = pattern
+  )
+  | summarize techniqueCount = dcount(matchedPattern),
+              matchedPatterns = make_set(matchedPattern),
+              eventCount = count(),
+              firstSeen = min(TimeGenerated),
+              lastSeen = max(TimeGenerated),
+              users = make_set(user)
+              by Computer = dstHost, srcHost
+  | where techniqueCount >= CHAIN_THRESHOLD
+  | project Computer, srcHost, techniqueCount, matchedPatterns, eventCount,
+            firstSeen, lastSeen, users
+  | extend timestamp = lastSeen, HostCustomEntity = Computer, AccountCustomEntity = tostring(users)
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: HostCustomEntity
+version: 1.0.0
+kind: Scheduled
+falsePositiveNotes: |
+  - IT admin tooling (SCCM, PDQ Deploy, remote admin scripts) legitimately uses
+    PsExec/WMI; maintain an allowlist of admin source hosts or service accounts.
+  - Vulnerability scanners trigger admin-share/SMB patterns; exclude scanner IPs.
+  - A single isolated match is usually noise; the rule deliberately requires a
+    CHAIN of >=2 distinct techniques before alerting.
+customDetails:
+  SourceHost: srcHost
+  TechniqueCount: techniqueCount
+  MatchedPatterns: matchedPatterns
+  Users: users

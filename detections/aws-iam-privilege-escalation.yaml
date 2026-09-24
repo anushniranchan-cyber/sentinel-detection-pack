@@ -1,0 +1,80 @@
+id: 5e9b7f31-2c8d-4a6e-9f3b-6d2c18e4a7b5
+name: AWS IAM Privilege Escalation via CloudTrail
+description: |
+  Detects IAM policy changes in AWS CloudTrail that grant elevated privileges:
+  attaching administrator/power-user policies, creating access keys, or assuming
+  privileged roles outside of approved change windows. Maps to T1098 (Account
+  Manipulation) and T1078 (Valid Accounts).
+severity: High
+status: Available
+requiredDataConnectors:
+  - connectorId: AWS
+    dataTypes:
+      - AWSCloudTrail
+queryFrequency: 15m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Persistence
+  - PrivilegeEscalation
+relevantTechniques:
+  - T1098
+  - T1078
+query: |
+  // IAM privilege-escalation primitives observed in CloudTrail management events.
+  // TUNING: expand privilegedPolicies with your org's custom admin policy ARNs.
+  let privilegedPolicies = dynamic([
+      "arn:aws:iam::aws:policy/AdministratorAccess",
+      "arn:aws:iam::aws:policy/PowerUserAccess",
+      "arn:aws:iam::aws:policy/IAMFullAccess"
+  ]);
+  let escalationEvents = dynamic([
+      "AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy",
+      "PutUserPolicy", "PutRolePolicy", "PutGroupPolicy",
+      "CreateAccessKey", "CreateLoginProfile",
+      "UpdateAssumeRolePolicy", "AddUserToGroup",
+      "CreatePolicy", "CreatePolicyVersion", "SetDefaultPolicyVersion"
+  ]);
+  AWSCloudTrail
+  | where TimeGenerated > ago(15m)
+  | where EventName in (escalationEvents)
+  | where ErrorCode == "" or isnull(ErrorCode)
+  | extend principal = tostring(parse_json(RecipientAccountId)),
+           actorArn = tostring(parse_json(UserIdentity.arn)),
+           actorType = tostring(parse_json(UserIdentity.type)),
+           requestParams = RequestParameters,
+           srcIp = SourceIpAddress,
+           region = AWSRegion
+  | extend policyArn = tostring(parse_json(RequestParameters).policyArn)
+  | extend isPrivileged = policyArn in (privilegedPolicies)
+  // Flag either a privileged-policy attach, or any escalation event performed
+  // by a non-human (assumed-role session) actor, which is higher risk
+  | where isPrivileged or actorType == "AssumedRole"
+  | project TimeGenerated, EventName, actorArn, actorType, policyArn,
+            srcIp, region, RecipientAccountId, UserAgent = UserAgent
+  | extend timestamp = TimeGenerated, AccountCustomEntity = actorArn, IPCustomEntity = srcIp
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: AccountCustomEntity
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPCustomEntity
+version: 1.0.0
+kind: Scheduled
+falsePositiveNotes: |
+  - IaC pipelines (Terraform/CloudFormation) routinely attach policies; exclude
+    the pipeline role ARN or correlate with your deployment change window.
+  - Break-glass admin roles will fire this by design; maintain an allowlist of
+    approved break-glass ARNs.
+  - Focus triage on events where actorType == "AssumedRole" AND the source IP is
+    outside your corporate/VPN ranges.
+customDetails:
+  EventName: EventName
+  ActorArn: actorArn
+  PolicyArn: policyArn
+  SourceIP: srcIp
+  Region: region

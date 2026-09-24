@@ -1,0 +1,88 @@
+id: 3f8a2c11-7b4e-4d9f-a2c1-9e5d04b6a1f2
+name: Impossible Travel Sign-In
+description: |
+  Detects successful interactive sign-ins by the same user from two geographically
+  distant locations within an impossibly short time window, indicating possible
+  account compromise (T1078). Excludes known corporate egress IPs and trusted
+  locations. Tune the TIME_WINDOW_HOURS and DISTANCE_KM parameters to your
+  environment.
+severity: High
+status: Available
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+relevantTechniques:
+  - T1078
+query: |
+  // Impossible travel detection.
+  // TUNING: adjust timeWindowHours / minDistanceKm for your user base.
+  let timeWindowHours = 1;
+  let minDistanceKm = 800;
+  let corpEgressIps = dynamic([
+    // Add your corporate NAT/VPN egress IPs here, e.g. "203.0.113.10"
+  ]);
+  let signins =
+      SigninLogs
+      | where TimeGenerated > ago(timeWindowHours)
+      | where ResultType == 0
+      | where isnotempty(LocationDetails)
+      | extend country = tostring(LocationDetails.countryOrRegion),
+               state = tostring(LocationDetails.state),
+               city = tostring(LocationDetails.city),
+               lat = todouble(LocationDetails.geoCoordinates.latitude),
+               lon = todouble(LocationDetails.geoCoordinates.longitude)
+      | where isnotempty(lat) and isnotempty(lon)
+      | where IPAddress !in (corpEgressIps)
+      | where isnotempty(country)
+      | project TimeGenerated, UserPrincipalName, IPAddress, country, state, city, lat, lon, AppDisplayName;
+  signins
+  | join kind=inner (signins) on UserPrincipalName
+  | where TimeGenerated < TimeGenerated1
+  | where country != country1 or state != state1
+  // Haversine distance in km
+  | extend R = 6371,
+           dLat = (lat1 - lat) * 3.14159265358979 / 180,
+           dLon = (lon1 - lon) * 3.14159265358979 / 180,
+           aLat = lat * 3.14159265358979 / 180,
+           aLat1 = lat1 * 3.14159265358979 / 180
+  | extend h = pow(sin(dLat/2), 2) + cos(aLat) * cos(aLat1) * pow(sin(dLon/2), 2),
+           distKm = 2 * R * asin(sqrt(h)),
+           deltaMin = datetime_diff('minute', TimeGenerated1, TimeGenerated)
+  | where distKm > minDistanceKm
+  // A commercial jet covers ~800-900 km/h; anything faster than this is impossible
+  | where distKm / (deltaMin / 60.0) > 900
+  | project TimeGenerated, UserPrincipalName, IPAddress, country, city,
+            IPAddress1, country1, city1, TimeGenerated1, distKm, deltaMin, AppDisplayName
+  | extend timestamp = TimeGenerated, AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: AccountCustomEntity
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPCustomEntity
+version: 1.0.0
+kind: Scheduled
+falsePositiveNotes: |
+  - Users on VPNs that exit in unexpected regions will trip this rule; add known
+    VPN egress ranges to corpEgressIps.
+  - Mobile users with carrier-grade NAT can show geo-IP jitter; consider raising
+    minDistanceKm or requiring a minimum session separation.
+  - Corporate travel booked same-day is benign; cross-check with the user's travel
+    calendar before escalating.
+customDetails:
+  FirstIPAddress: IPAddress
+  FirstCountry: country
+  SecondIPAddress: IPAddress1
+  SecondCountry: country1
+  DistanceKm: distKm
+  MinutesBetween: deltaMin

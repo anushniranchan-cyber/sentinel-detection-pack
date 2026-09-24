@@ -1,0 +1,63 @@
+id: 8c1d4e22-9a6b-4e3f-b8d2-1f7a05c9e3a4
+name: Mass File Download from SharePoint / OneDrive
+description: |
+  Detects a single user downloading an abnormally high number of files from
+  SharePoint/OneDrive in a short window, consistent with data-staging prior to
+  exfiltration (T1213 / T1039). Threshold is tunable via the DOWNLOAD_THRESHOLD
+  parameter. Excludes known service accounts.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: Office365
+    dataTypes:
+      - OfficeActivity
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Collection
+relevantTechniques:
+  - T1213
+  - T1039
+query: |
+  // Mass download detection against SharePoint/OneDrive audit logs.
+  // TUNING: DOWNLOAD_THRESHOLD = files per user per hour that is "abnormal"
+  // for your tenant. Start high (e.g. 100) and lower after baselining.
+  let DOWNLOAD_THRESHOLD = 100;
+  let LOOKBACK = 1h;
+  let excludedAccounts = dynamic([
+    // Add service/system accounts that bulk-sync legitimately, e.g. "svc-backup@contoso.com"
+  ]);
+  OfficeActivity
+  | where TimeGenerated > ago(LOOKBACK)
+  | where RecordType in ("SharePointFileOperation", "OneDrive")
+  | where Operation in ("FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial")
+  | where UserId !in (excludedAccounts)
+  | summarize downloadCount = count(),
+              firstSeen = min(TimeGenerated),
+              lastSeen = max(TimeGenerated),
+              distinctFiles = dcount(tostring(ObjectId)),
+              sites = make_set(tostring(Site_)),
+              clientIps = make_set(ClientIP)
+              by UserId
+  | where downloadCount >= DOWNLOAD_THRESHOLD
+  | project UserId, downloadCount, distinctFiles, firstSeen, lastSeen, sites, clientIps
+  | extend timestamp = lastSeen, AccountCustomEntity = UserId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: AccountCustomEntity
+version: 1.0.0
+kind: Scheduled
+falsePositiveNotes: |
+  - Legitimate bulk syncs (new laptop setup, OneDrive client re-sync) look exactly
+    like this; verify with the user before escalating.
+  - Backup/migration service accounts must be in excludedAccounts.
+  - Consider pairing with a DLP/network-egress alert to confirm exfiltration.
+customDetails:
+  DownloadCount: downloadCount
+  DistinctFiles: distinctFiles
+  Sites: sites
+  ClientIPs: clientIps
